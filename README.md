@@ -359,7 +359,7 @@ node --test tests/
 > We make individual API calls for each file to get content. With a token, you get higher rate limits and faster analysis.
 
 **Q: How accurate is the dependency analysis?**
-> It's based on function name matching, so it may miss some dynamic imports or renamed imports. It's designed for a quick overview, not 100% accuracy.
+> It's heuristic: unique functions are matched by name, while duplicate function names are scoped by file and explicit imports before edges are created. It may still miss dynamic imports or renamed runtime references, so it's designed for a quick overview, not 100% accuracy.
 
 ---
 

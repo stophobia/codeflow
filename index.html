@@ -2478,6 +2478,161 @@ const Parser={
         return byFile;
     },
 
+    functionKey:function(fn){
+        if(!fn)return'';
+        return [fn.file||'',fn.line||'',String(fn.name==null?'':fn.name)].join('|');
+    },
+
+    buildFunctionDefinitionIndex:function(fnDefs){
+        var byName=Object.create(null);
+        var byKey=Object.create(null);
+        (fnDefs||[]).forEach(function(fn){
+            if(!fn||typeof fn.name!=='string'||!fn.name)return;
+            var key=Parser.functionKey(fn);
+            fn.key=key;
+            if(byKey[key])return;
+            byKey[key]=fn;
+            if(!byName[fn.name])byName[fn.name]=[];
+            byName[fn.name].push(fn);
+        });
+        return{byName:byName,byKey:byKey};
+    },
+
+    resolveCallGraphImportPath:function(importPath,fromFile,files){
+        if(!importPath||/^(?:node:|https?:|data:|mailto:)/i.test(importPath))return null;
+        var fromPath=String(fromFile||'').replace(/\\/g,'/').replace(/^\/+/,'');
+        var fromDir=fromPath.indexOf('/')>=0?fromPath.split('/').slice(0,-1).join('/'):'';
+        var fromExt=(fromPath.split('.').pop()||'').toLowerCase();
+        var isPython=['py','pyw','pyi'].indexOf(fromExt)>=0;
+        var candidates=[];
+        function normalizePath(path){
+            var out=[];
+            String(path||'').replace(/\\/g,'/').split('/').forEach(function(part){
+                if(!part||part==='.')return;
+                if(part==='..')out.pop();
+                else out.push(part);
+            });
+            return out.join('/');
+        }
+        function addCandidate(path){
+            path=normalizePath(path);
+            if(path&&candidates.indexOf(path)<0)candidates.push(path);
+        }
+
+        if(importPath.startsWith('@/'))addCandidate('src/'+importPath.slice(2));
+        else if(importPath.startsWith('~/'))addCandidate('src/'+importPath.slice(2));
+        else if(importPath.startsWith('./')||importPath.startsWith('../'))addCandidate((fromDir?fromDir+'/':'')+importPath);
+        else if(isPython&&/^\.+/.test(importPath)){
+            var dotCount=(importPath.match(/^\.+/)||[''])[0].length;
+            var rest=importPath.slice(dotCount).replace(/\./g,'/');
+            var parts=fromDir?fromDir.split('/'):[];
+            for(var di=1;di<dotCount;di++)parts.pop();
+            addCandidate(parts.concat(rest?rest.split('/'):[]).join('/'));
+        }else if(isPython){
+            var modulePath=importPath.replace(/\./g,'/');
+            addCandidate((fromDir?fromDir+'/':'')+modulePath);
+            addCandidate(modulePath);
+        }else{
+            return null;
+        }
+
+        var pathMap=Object.create(null);
+        (files||[]).forEach(function(file){
+            var p=String(file.path||file.name||'').replace(/\\/g,'/').replace(/^\/+/,'');
+            if(p)pathMap[p.toLowerCase()]=p;
+        });
+        var exts=['','.js','.jsx','.ts','.tsx','.mjs','.cjs','.vue','.svelte','.py','.pyw','.pyi','.vba','.bas','.cls','/index.js','/index.jsx','/index.ts','/index.tsx','/__init__.py'];
+        for(var i=0;i<candidates.length;i++){
+            for(var j=0;j<exts.length;j++){
+                var candidate=normalizePath(candidates[i]+exts[j]).toLowerCase();
+                if(pathMap[candidate])return pathMap[candidate];
+            }
+        }
+        return null;
+    },
+
+    extractCallGraphImportMap:function(content,fromFile,files){
+        var locals=Object.create(null);
+        var targets=new Set();
+        function addLocal(localName,resolved){
+            if(!localName||!resolved)return;
+            if(!locals[localName])locals[localName]=new Set();
+            locals[localName].add(resolved);
+            targets.add(resolved);
+        }
+        function addTarget(resolved){
+            if(resolved)targets.add(resolved);
+        }
+        function parseImportNames(spec,resolved){
+            (spec||'').split(',').forEach(function(part){
+                part=part.trim().replace(/^type\s+/,'').trim();
+                if(!part||part==='default')return;
+                var alias=part.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
+                if(alias){addLocal(alias[2],resolved);return;}
+                var destructured=part.match(/^([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)$/);
+                if(destructured){addLocal(destructured[2],resolved);return;}
+                var name=part.match(/^([A-Za-z_$][\w$]*)$/);
+                if(name)addLocal(name[1],resolved);
+            });
+        }
+        function parseJsImportSpec(spec,resolved){
+            spec=(spec||'').trim().replace(/^type\s+/,'').trim();
+            if(!spec)return;
+            var named=spec.match(/\{([\s\S]*?)\}/);
+            if(named)parseImportNames(named[1],resolved);
+            var ns=spec.match(/\*\s+as\s+([A-Za-z_$][\w$]*)/);
+            if(ns)addLocal(ns[1],resolved);
+            var defaultPart=spec.split('{')[0].split('*')[0].split(',')[0].trim();
+            if(/^[A-Za-z_$][\w$]*$/.test(defaultPart))addLocal(defaultPart,resolved);
+        }
+
+        var source=String(content||'');
+        var match;
+        var jsImportRe=/\bimport\s+(?!\()([\s\S]*?)\s+from\s*['"`]([^'"`]+)['"`]/g;
+        while((match=jsImportRe.exec(source))!==null){
+            var importSpec=match[1]||'';
+            if(/^\s*type\b/.test(importSpec))continue;
+            var resolved=Parser.resolveCallGraphImportPath(match[2],fromFile,files);
+            addTarget(resolved);
+            parseJsImportSpec(importSpec,resolved);
+        }
+        var cjsNamedRe=/\b(?:const|let|var)\s+\{([\s\S]*?)\}\s*=\s*require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g;
+        while((match=cjsNamedRe.exec(source))!==null){
+            var namedResolved=Parser.resolveCallGraphImportPath(match[2],fromFile,files);
+            addTarget(namedResolved);
+            parseImportNames(match[1],namedResolved);
+        }
+        var cjsDefaultRe=/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g;
+        while((match=cjsDefaultRe.exec(source))!==null){
+            var defaultResolved=Parser.resolveCallGraphImportPath(match[2],fromFile,files);
+            addLocal(match[1],defaultResolved);
+        }
+
+        var pyFromRe=/^\s*from\s+([.\w]+)\s+import\s+([^\n#]+)/gm;
+        while((match=pyFromRe.exec(source))!==null){
+            var pyResolved=Parser.resolveCallGraphImportPath(match[1],fromFile,files);
+            addTarget(pyResolved);
+            parseImportNames(match[2].replace(/[()]/g,''),pyResolved);
+        }
+        var pyImportRe=/^\s*import\s+([^\n#]+)/gm;
+        while((match=pyImportRe.exec(source))!==null){
+            match[1].split(',').forEach(function(part){
+                part=part.trim();
+                var pieces=part.split(/\s+as\s+/);
+                var moduleName=(pieces[0]||'').trim();
+                var localName=(pieces[1]||moduleName.split('.').pop()||'').trim();
+                var moduleResolved=Parser.resolveCallGraphImportPath(moduleName,fromFile,files);
+                addLocal(localName,moduleResolved);
+            });
+        }
+
+        var localFiles=Object.create(null);
+        Object.keys(locals).forEach(function(name){
+            localFiles[name]=Array.from(locals[name]);
+        });
+        return{locals:localFiles,targets:targets};
+    },
+
     candidateFunctionNames:function(content,fnNames,fnIndex){
         if(!content||!fnNames||!fnNames.length)return[];
         if(fnNames.length<=Parser._callCandidateThreshold)return fnNames;
@@ -4462,30 +4617,73 @@ async function buildAnalysisData(options){
     progress('Building dependency graph (1/6)...');
     await yieldFn();
     await Parser.prepareTreeSitter(analyzed);
-    var fnNames=[...new Set(allFns.map(function(f){return f.name;}))];
+    var fnDefIndex=Parser.buildFunctionDefinitionIndex(allFns);
+    var fnNames=Object.keys(fnDefIndex.byName);
     var fnNameIndex=Parser.buildFunctionNameIndex(fnNames);
     var fnDefLineIndex=Parser.buildFunctionDefLineIndex(allFns);
+    var fileImportInfo=Object.create(null);
+    analyzed.forEach(function(file){
+        fileImportInfo[file.path]=Parser.extractCallGraphImportMap(file.content||'',file.path,analyzed);
+    });
     var conns=[];
     var fnStats=Object.create(null);
 
-    allFns.forEach(function(fn){
-        if(!fnStats[fn.name]){
-            fnStats[fn.name]={
-                internal:0,
-                external:0,
-                callers:new Map(),
-                file:fn.file,
-                folder:fn.folder,
-                line:fn.line,
-                code:fn.code,
-                isTopLevel:fn.isTopLevel!==false,
-                isExported:fn.isExported||false,
-                isClassMethod:fn.isClassMethod||false,
-                type:fn.type||'function',
-                decorators:fn.decorators||null,
-                className:fn.className||null
-            };
+    function createFunctionStat(fn){
+        return{
+            key:fn.key,
+            name:fn.name,
+            internal:0,
+            external:0,
+            callers:new Map(),
+            file:fn.file,
+            folder:fn.folder,
+            line:fn.line,
+            code:fn.code,
+            isTopLevel:fn.isTopLevel!==false,
+            isExported:fn.isExported||false,
+            isClassMethod:fn.isClassMethod||false,
+            type:fn.type||'function',
+            decorators:fn.decorators||null,
+            className:fn.className||null
+        };
+    }
+
+    function firstDefinitionFromOneFile(defs){
+        if(!defs.length)return null;
+        var file=defs[0].file;
+        for(var i=1;i<defs.length;i++){
+            if(defs[i].file!==file)return null;
         }
+        return defs[0];
+    }
+
+    function resolveCallDefinitions(fnName,file){
+        var defs=fnDefIndex.byName[fnName]||[];
+        if(!defs.length)return[];
+        var sameFile=defs.filter(function(def){return def.file===file.path;});
+        var sameFileDef=firstDefinitionFromOneFile(sameFile);
+        if(sameFileDef)return[sameFileDef];
+        if(defs.length===1)return[defs[0]];
+
+        var imports=fileImportInfo[file.path]||{locals:Object.create(null),targets:new Set()};
+        var directImports=(imports.locals&&imports.locals[fnName])||[];
+        var matches=[];
+        if(directImports.length){
+            matches=defs.filter(function(def){return directImports.indexOf(def.file)>=0;});
+            var directDef=firstDefinitionFromOneFile(matches);
+            if(directDef)return[directDef];
+        }
+
+        if(imports.targets&&typeof imports.targets.has==='function'){
+            matches=defs.filter(function(def){return imports.targets.has(def.file);});
+            var importedDef=firstDefinitionFromOneFile(matches);
+            if(importedDef)return[importedDef];
+        }
+        return[];
+    }
+
+    Object.keys(fnDefIndex.byKey).forEach(function(key){
+        fnStats[key]=createFunctionStat(fnDefIndex.byKey[key]);
     });
 
     for(var bi=0;bi<analyzed.length;bi+=CALL_BATCH){
@@ -4498,17 +4696,20 @@ async function buildAnalysisData(options){
             Object.entries(calls).forEach(function(entry){
                 var fn=entry[0],cnt=entry[1];
                 if(cnt<=0)return;
-                var def=fnStats[fn]?fnStats[fn].file:null;
-                if(!def)return;
-                if(def===file.path){
-                    fnStats[fn].internal+=cnt;
-                }else{
-                    conns.push({source:def,target:file.path,fn:fn,count:cnt});
-                    var ex=fnStats[fn].callers.get(file.path);
-                    if(ex)ex.count+=cnt;
-                    else fnStats[fn].callers.set(file.path,{file:file.path,name:file.name,count:cnt});
-                    fnStats[fn].external+=cnt;
-                }
+                var defs=resolveCallDefinitions(fn,file);
+                defs.forEach(function(def){
+                    var stat=fnStats[def.key];
+                    if(!stat)return;
+                    if(def.file===file.path){
+                        stat.internal+=cnt;
+                    }else{
+                        conns.push({source:def.file,target:file.path,fn:fn,count:cnt,functionKey:def.key});
+                        var ex=stat.callers.get(file.path);
+                        if(ex)ex.count+=cnt;
+                        else stat.callers.set(file.path,{file:file.path,name:file.name,count:cnt});
+                        stat.external+=cnt;
+                    }
+                });
             });
         }
         await yieldFn();
@@ -4537,7 +4738,7 @@ async function buildAnalysisData(options){
 
     var issues=[];
     var deadFns=Object.entries(fnStats).filter(function(x){
-        var name=x[0],stats=x[1];
+        var stats=x[1],name=stats.name;
         if(stats.internal>0||stats.external>0)return false;
         if(stats.isClassMethod)return false;
         if(!stats.isTopLevel)return false;
@@ -4553,7 +4754,7 @@ async function buildAnalysisData(options){
         if(stats.file&&(/\.(?:spec|test)\.[jt]sx?$/.test(stats.file)||stats.file.includes('__tests__')))return false;
         return true;
     });
-    if(deadFns.length)issues.push({type:'warning',title:deadFns.length+' Unused Functions',desc:'Functions not called from other files',items:deadFns.map(function(x){return{name:x[0],file:x[1].file,line:x[1].line,code:x[1].code};})});
+    if(deadFns.length)issues.push({type:'warning',title:deadFns.length+' Unused Functions',desc:'Functions not called from other files',items:deadFns.map(function(x){return{name:x[1].name,file:x[1].file,line:x[1].line,code:x[1].code};})});
 
     var godFiles=analyzed.filter(function(f){return f.functions.length>15;});
     if(godFiles.length)issues.push({type:'critical',title:godFiles.length+' Large Files',desc:'Files with 15+ functions',items:godFiles.map(function(f){return{name:f.name+' ('+f.functions.length+' fns)',file:f.path,fns:f.functions.length,lines:f.lines};})});
@@ -4638,7 +4839,7 @@ async function buildAnalysisData(options){
         duplicates:duplicates,
         layerViolations:layerViolations,
         architectureDiagram:architectureDiagram,
-        deadFunctions:deadFns.map(function(x){var codeLines=x[1].code?x[1].code.split('\n').length:0;return{name:x[0],file:x[1].file,folder:x[1].folder,line:x[1].line,code:x[1].code,codeLines:codeLines,ext:x[1].file.split('.').pop()};}),
+        deadFunctions:deadFns.map(function(x){var codeLines=x[1].code?x[1].code.split('\n').length:0;return{name:x[1].name,file:x[1].file,folder:x[1].folder,line:x[1].line,code:x[1].code,codeLines:codeLines,ext:x[1].file.split('.').pop()};}),
         excludePatterns:excludePatterns,
         stats:{files:analyzed.length,functions:allFns.length,connections:conns.length,dead:deadFns.length,patterns:patterns.length,security:securityIssues.filter(function(i){return i.severity==='high';}).length,duplicates:duplicates.length,violations:layerViolations.length,loc:totalLoc,languages:langArray,parserModes:parserArray}
     };
@@ -7674,8 +7875,10 @@ function App(){
             },
             files:data.files.map(function(f){
                 var fns=f.functions.map(function(fn){
-                    var st=data.fnStats[fn.name];
+                    var statKey=fn.key||Parser.functionKey(fn);
+                    var st=data.fnStats[statKey]||data.fnStats[fn.name];
                     return{
+                        key:statKey,
                         name:fn.name,
                         line:fn.line,
                         internalCalls:st?st.internal:0,
@@ -7716,10 +7919,11 @@ function App(){
             suggestions:data.suggestions||[],
             languageBreakdown:data.stats.languages||[],
             folderStructure:data.folders,
-            functionStatistics:Object.keys(data.fnStats||{}).map(function(fnName){
-                var st=data.fnStats[fnName];
+            functionStatistics:Object.keys(data.fnStats||{}).map(function(fnKey){
+                var st=data.fnStats[fnKey];
                 return{
-                    name:fnName,
+                    key:fnKey,
+                    name:st.name||fnKey,
                     file:st.file,
                     folder:st.folder,
                     line:st.line,
@@ -8450,11 +8654,13 @@ function App(){
                                 expandedCards.has('fns')&&React.createElement('div',{className:'card-body',style:{padding:8}},
                                     selected.functions.length===0?React.createElement('div',{style:{fontSize:10,color:'var(--t3)',padding:8,textAlign:'center'}},'No functions detected'):
                                     selected.functions.map(function(fn){
-                                        var st=data.fnStats[fn.name];
-                                        var isExpanded=expandedFns.has(fn.name);
+                                        var statKey=fn.key||Parser.functionKey(fn);
+                                        var st=data.fnStats[statKey]||data.fnStats[fn.name];
+                                        var expandKey=statKey||fn.name;
+                                        var isExpanded=expandedFns.has(expandKey);
                                         var intCalls=st?st.internal:0,extCalls=st?st.external:0;
-                                        return React.createElement('div',{key:fn.name,className:'fn-item'},
-                                            React.createElement('div',{className:'fn-header',onClick:function(){toggleFn(fn.name);}},
+                                        return React.createElement('div',{key:expandKey,className:'fn-item'},
+                                            React.createElement('div',{className:'fn-header',onClick:function(){toggleFn(expandKey);}},
                                                 React.createElement('span',{className:'fn-name'},fn.name,'()'),
                                                 React.createElement('span',{style:{display:'flex',alignItems:'center',gap:4}},
                                                     React.createElement('button',{className:'view-file-btn',onClick:function(e){e.stopPropagation();openFilePreview(selected.path,fn.line);},title:'View source'},React.createElement(Icon,{name:'eye',size:'s'})),
